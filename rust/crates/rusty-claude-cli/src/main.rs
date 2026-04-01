@@ -5,16 +5,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::{
-    oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, ApiError, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, ImageSource,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -23,11 +22,10 @@ use commands::{
 use compat_harness::{extract_manifest, UpstreamPaths};
 use render::{Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, generate_pkce_pair, generate_state, load_oauth_credentials,
-    load_system_prompt, parse_oauth_callback_request_target, save_oauth_credentials, ApiClient,
-    ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, McpClientBootstrap, McpClientTransport,
-    McpServerConfig, McpStdioProcess, MessageRole, OAuthAuthorizationRequest,
+    clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
+    parse_oauth_callback_request_target, save_oauth_credentials, ApiClient, ApiRequest,
+    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest,
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
@@ -43,6 +41,7 @@ const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 
 type AllowedToolSet = BTreeSet<String>;
+const IMAGE_REF_PREFIX: &str = "@";
 
 fn main() {
     if let Err(error) = run() {
@@ -76,7 +75,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
-        CliAction::Doctor => run_doctor()?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -109,7 +107,6 @@ enum CliAction {
     },
     Login,
     Logout,
-    Doctor,
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
@@ -234,7 +231,6 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
-        "doctor" => Ok(CliAction::Doctor),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -523,627 +519,6 @@ fn wait_for_oauth_callback(
     );
     stream.write_all(response.as_bytes())?;
     Ok(callback)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiagnosticLevel {
-    Ok,
-    Warn,
-    Fail,
-}
-
-impl DiagnosticLevel {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Ok => "OK",
-            Self::Warn => "WARN",
-            Self::Fail => "FAIL",
-        }
-    }
-
-    const fn is_failure(self) -> bool {
-        matches!(self, Self::Fail)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DiagnosticCheck {
-    name: &'static str,
-    level: DiagnosticLevel,
-    summary: String,
-    details: Vec<String>,
-}
-
-impl DiagnosticCheck {
-    fn new(name: &'static str, level: DiagnosticLevel, summary: impl Into<String>) -> Self {
-        Self {
-            name,
-            level,
-            summary: summary.into(),
-            details: Vec::new(),
-        }
-    }
-
-    fn with_details(mut self, details: Vec<String>) -> Self {
-        self.details = details;
-        self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OAuthDiagnosticStatus {
-    Missing,
-    Valid,
-    ExpiredRefreshable,
-    ExpiredNoRefresh,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ConfigFileCheck {
-    path: PathBuf,
-    exists: bool,
-    valid: bool,
-    note: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DoctorReport {
-    checks: Vec<DiagnosticCheck>,
-}
-
-impl DoctorReport {
-    fn has_failures(&self) -> bool {
-        self.checks.iter().any(|check| check.level.is_failure())
-    }
-
-    fn render(&self) -> String {
-        let mut lines = vec!["Doctor diagnostics".to_string()];
-        let ok_count = self
-            .checks
-            .iter()
-            .filter(|check| check.level == DiagnosticLevel::Ok)
-            .count();
-        let warn_count = self
-            .checks
-            .iter()
-            .filter(|check| check.level == DiagnosticLevel::Warn)
-            .count();
-        let fail_count = self
-            .checks
-            .iter()
-            .filter(|check| check.level == DiagnosticLevel::Fail)
-            .count();
-        lines.push(format!(
-            "Summary\n  OK               {ok_count}\n  Warnings         {warn_count}\n  Failures         {fail_count}"
-        ));
-        lines.extend(self.checks.iter().map(render_diagnostic_check));
-        lines.join("\n\n")
-    }
-}
-
-fn render_diagnostic_check(check: &DiagnosticCheck) -> String {
-    let mut section = vec![format!(
-        "{}\n  Status           {}\n  Summary          {}",
-        check.name,
-        check.level.label(),
-        check.summary
-    )];
-    if !check.details.is_empty() {
-        section.push("  Details".to_string());
-        section.extend(check.details.iter().map(|detail| format!("    - {detail}")));
-    }
-    section.join("\n")
-}
-
-fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
-    let config_loader = ConfigLoader::default_for(&cwd);
-    let config = config_loader.load();
-    let report = DoctorReport {
-        checks: vec![
-            check_api_key_validity(config.as_ref().ok()),
-            check_oauth_token_status(config.as_ref().ok()),
-            check_config_files(&config_loader, config.as_ref()),
-            check_git_availability(&cwd),
-            check_mcp_server_health(config.as_ref().ok()),
-            check_network_connectivity(),
-            check_system_info(&cwd, config.as_ref().ok()),
-        ],
-    };
-    println!("{}", report.render());
-    if report.has_failures() {
-        return Err("doctor found failing checks".into());
-    }
-    Ok(())
-}
-
-fn check_api_key_validity(config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
-    let api_key = match env::var("ANTHROPIC_API_KEY") {
-        Ok(value) if !value.trim().is_empty() => value,
-        Ok(_) | Err(env::VarError::NotPresent) => {
-            return DiagnosticCheck::new(
-                "API key validity",
-                DiagnosticLevel::Warn,
-                "ANTHROPIC_API_KEY is not set",
-            );
-        }
-        Err(error) => {
-            return DiagnosticCheck::new(
-                "API key validity",
-                DiagnosticLevel::Fail,
-                format!("failed to read ANTHROPIC_API_KEY: {error}"),
-            );
-        }
-    };
-
-    let request = MessageRequest {
-        model: config
-            .and_then(runtime::RuntimeConfig::model)
-            .unwrap_or(DEFAULT_MODEL)
-            .to_string(),
-        max_tokens: 1,
-        messages: vec![InputMessage {
-            role: "user".to_string(),
-            content: vec![InputContentBlock::Text {
-                text: "Reply with OK.".to_string(),
-            }],
-        }],
-        system: None,
-        tools: None,
-        tool_choice: None,
-        stream: false,
-    };
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            return DiagnosticCheck::new(
-                "API key validity",
-                DiagnosticLevel::Fail,
-                format!("failed to create async runtime: {error}"),
-            );
-        }
-    };
-    match runtime
-        .block_on(AnthropicClient::from_auth(AuthSource::ApiKey(api_key)).send_message(&request))
-    {
-        Ok(response) => DiagnosticCheck::new(
-            "API key validity",
-            DiagnosticLevel::Ok,
-            "Anthropic API accepted the configured API key",
-        )
-        .with_details(vec![format!(
-            "request_id={} input_tokens={} output_tokens={}",
-            response.request_id.unwrap_or_else(|| "<none>".to_string()),
-            response.usage.input_tokens,
-            response.usage.output_tokens
-        )]),
-        Err(ApiError::Api { status, .. }) if status.as_u16() == 401 || status.as_u16() == 403 => {
-            DiagnosticCheck::new(
-                "API key validity",
-                DiagnosticLevel::Fail,
-                format!("Anthropic API rejected the API key with HTTP {status}"),
-            )
-        }
-        Err(error) => DiagnosticCheck::new(
-            "API key validity",
-            DiagnosticLevel::Warn,
-            format!("unable to conclusively validate the API key: {error}"),
-        ),
-    }
-}
-
-fn classify_oauth_status() -> Result<(OAuthDiagnosticStatus, Vec<String>), io::Error> {
-    let Some(token_set) = load_oauth_credentials()? else {
-        return Ok((OAuthDiagnosticStatus::Missing, vec![]));
-    };
-    let token = api::OAuthTokenSet {
-        access_token: token_set.access_token.clone(),
-        refresh_token: token_set.refresh_token.clone(),
-        expires_at: token_set.expires_at,
-        scopes: token_set.scopes.clone(),
-    };
-    let details = vec![format!(
-        "expires_at={} refresh_token={} scopes={}",
-        token
-            .expires_at
-            .map_or_else(|| "<none>".to_string(), |value| value.to_string()),
-        if token.refresh_token.is_some() {
-            "present"
-        } else {
-            "absent"
-        },
-        if token.scopes.is_empty() {
-            "<none>".to_string()
-        } else {
-            token.scopes.join(",")
-        }
-    )];
-    let status = if oauth_token_is_expired(&token) {
-        if token.refresh_token.is_some() {
-            OAuthDiagnosticStatus::ExpiredRefreshable
-        } else {
-            OAuthDiagnosticStatus::ExpiredNoRefresh
-        }
-    } else {
-        OAuthDiagnosticStatus::Valid
-    };
-    Ok((status, details))
-}
-
-fn check_oauth_token_status(config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
-    match classify_oauth_status() {
-        Ok((OAuthDiagnosticStatus::Missing, _)) => DiagnosticCheck::new(
-            "OAuth token status",
-            DiagnosticLevel::Warn,
-            "no saved OAuth credentials found",
-        ),
-        Ok((OAuthDiagnosticStatus::Valid, details)) => DiagnosticCheck::new(
-            "OAuth token status",
-            DiagnosticLevel::Ok,
-            "saved OAuth token is present and not expired",
-        )
-        .with_details(details),
-        Ok((OAuthDiagnosticStatus::ExpiredRefreshable, mut details)) => {
-            let refresh_ready = config.and_then(runtime::RuntimeConfig::oauth).is_some();
-            details.push(if refresh_ready {
-                "runtime OAuth config is present for refresh".to_string()
-            } else {
-                "runtime OAuth config is missing for refresh".to_string()
-            });
-            DiagnosticCheck::new(
-                "OAuth token status",
-                if refresh_ready {
-                    DiagnosticLevel::Warn
-                } else {
-                    DiagnosticLevel::Fail
-                },
-                "saved OAuth token is expired but includes a refresh token",
-            )
-            .with_details(details)
-        }
-        Ok((OAuthDiagnosticStatus::ExpiredNoRefresh, details)) => DiagnosticCheck::new(
-            "OAuth token status",
-            DiagnosticLevel::Fail,
-            "saved OAuth token is expired and cannot refresh",
-        )
-        .with_details(details),
-        Err(error) => DiagnosticCheck::new(
-            "OAuth token status",
-            DiagnosticLevel::Fail,
-            format!("failed to read saved OAuth credentials: {error}"),
-        ),
-    }
-}
-
-fn validate_config_file(path: &Path) -> ConfigFileCheck {
-    match fs::read_to_string(path) {
-        Ok(contents) => {
-            if contents.trim().is_empty() {
-                return ConfigFileCheck {
-                    path: path.to_path_buf(),
-                    exists: true,
-                    valid: true,
-                    note: "exists but is empty".to_string(),
-                };
-            }
-            match serde_json::from_str::<serde_json::Value>(&contents) {
-                Ok(serde_json::Value::Object(_)) => ConfigFileCheck {
-                    path: path.to_path_buf(),
-                    exists: true,
-                    valid: true,
-                    note: "valid JSON object".to_string(),
-                },
-                Ok(_) => ConfigFileCheck {
-                    path: path.to_path_buf(),
-                    exists: true,
-                    valid: false,
-                    note: "top-level JSON value is not an object".to_string(),
-                },
-                Err(error) => ConfigFileCheck {
-                    path: path.to_path_buf(),
-                    exists: true,
-                    valid: false,
-                    note: format!("invalid JSON: {error}"),
-                },
-            }
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => ConfigFileCheck {
-            path: path.to_path_buf(),
-            exists: false,
-            valid: true,
-            note: "not present".to_string(),
-        },
-        Err(error) => ConfigFileCheck {
-            path: path.to_path_buf(),
-            exists: true,
-            valid: false,
-            note: format!("unreadable: {error}"),
-        },
-    }
-}
-
-fn check_config_files(
-    config_loader: &ConfigLoader,
-    config: Result<&runtime::RuntimeConfig, &runtime::ConfigError>,
-) -> DiagnosticCheck {
-    let file_checks = config_loader
-        .discover()
-        .into_iter()
-        .map(|entry| validate_config_file(&entry.path))
-        .collect::<Vec<_>>();
-    let existing_count = file_checks.iter().filter(|check| check.exists).count();
-    let invalid_count = file_checks
-        .iter()
-        .filter(|check| check.exists && !check.valid)
-        .count();
-    let mut details = file_checks
-        .iter()
-        .map(|check| format!("{} => {}", check.path.display(), check.note))
-        .collect::<Vec<_>>();
-    match config {
-        Ok(runtime_config) => details.push(format!(
-            "merged load succeeded with {} loaded file(s)",
-            runtime_config.loaded_entries().len()
-        )),
-        Err(error) => details.push(format!("merged load failed: {error}")),
-    }
-    DiagnosticCheck::new(
-        "Config files",
-        if invalid_count > 0 || config.is_err() {
-            DiagnosticLevel::Fail
-        } else if existing_count == 0 {
-            DiagnosticLevel::Warn
-        } else {
-            DiagnosticLevel::Ok
-        },
-        format!(
-            "discovered {} candidate file(s), {} existing, {} invalid",
-            file_checks.len(),
-            existing_count,
-            invalid_count
-        ),
-    )
-    .with_details(details)
-}
-
-fn check_git_availability(cwd: &Path) -> DiagnosticCheck {
-    match Command::new("git").arg("--version").output() {
-        Ok(version_output) if version_output.status.success() => {
-            let version = String::from_utf8_lossy(&version_output.stdout)
-                .trim()
-                .to_string();
-            match Command::new("git")
-                .args(["rev-parse", "--show-toplevel"])
-                .current_dir(cwd)
-                .output()
-            {
-                Ok(root_output) if root_output.status.success() => DiagnosticCheck::new(
-                    "Git availability",
-                    DiagnosticLevel::Ok,
-                    "git is installed and the current directory is inside a repository",
-                )
-                .with_details(vec![
-                    version,
-                    format!(
-                        "repo_root={}",
-                        String::from_utf8_lossy(&root_output.stdout).trim()
-                    ),
-                ]),
-                Ok(_) => DiagnosticCheck::new(
-                    "Git availability",
-                    DiagnosticLevel::Warn,
-                    "git is installed but the current directory is not a repository",
-                )
-                .with_details(vec![version]),
-                Err(error) => DiagnosticCheck::new(
-                    "Git availability",
-                    DiagnosticLevel::Warn,
-                    format!("git is installed but repo detection failed: {error}"),
-                )
-                .with_details(vec![version]),
-            }
-        }
-        Ok(output) => DiagnosticCheck::new(
-            "Git availability",
-            DiagnosticLevel::Fail,
-            format!("git --version exited with status {}", output.status),
-        ),
-        Err(error) => DiagnosticCheck::new(
-            "Git availability",
-            DiagnosticLevel::Fail,
-            format!("failed to execute git: {error}"),
-        ),
-    }
-}
-
-fn check_one_mcp_server(
-    name: &str,
-    server: &runtime::ScopedMcpServerConfig,
-) -> (DiagnosticLevel, String) {
-    match &server.config {
-        McpServerConfig::Stdio(_) => {
-            let bootstrap = McpClientBootstrap::from_scoped_config(name, server);
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    return (
-                        DiagnosticLevel::Fail,
-                        format!("{name}: runtime error: {error}"),
-                    )
-                }
-            };
-            let detail = runtime.block_on(async {
-                match tokio::time::timeout(Duration::from_secs(3), async {
-                    let mut process = McpStdioProcess::spawn(match &bootstrap.transport {
-                        McpClientTransport::Stdio(transport) => transport,
-                        _ => unreachable!("stdio bootstrap expected"),
-                    })?;
-                    let result = process
-                        .initialize(
-                            runtime::JsonRpcId::Number(1),
-                            runtime::McpInitializeParams {
-                                protocol_version: "2025-03-26".to_string(),
-                                capabilities: serde_json::Value::Object(serde_json::Map::new()),
-                                client_info: runtime::McpInitializeClientInfo {
-                                    name: "doctor".to_string(),
-                                    version: VERSION.to_string(),
-                                },
-                            },
-                        )
-                        .await;
-                    let _ = process.terminate().await;
-                    result
-                })
-                .await
-                {
-                    Ok(Ok(response)) => {
-                        if let Some(error) = response.error {
-                            (
-                                DiagnosticLevel::Fail,
-                                format!(
-                                    "{name}: initialize JSON-RPC error {} ({})",
-                                    error.message, error.code
-                                ),
-                            )
-                        } else if let Some(result) = response.result {
-                            (
-                                DiagnosticLevel::Ok,
-                                format!(
-                                    "{name}: ok (server {} {})",
-                                    result.server_info.name, result.server_info.version
-                                ),
-                            )
-                        } else {
-                            (
-                                DiagnosticLevel::Fail,
-                                format!("{name}: initialize returned no result"),
-                            )
-                        }
-                    }
-                    Ok(Err(error)) => (
-                        DiagnosticLevel::Fail,
-                        format!("{name}: spawn/initialize failed: {error}"),
-                    ),
-                    Err(_) => (
-                        DiagnosticLevel::Fail,
-                        format!("{name}: timed out during initialize"),
-                    ),
-                }
-            });
-            detail
-        }
-        other => (
-            DiagnosticLevel::Warn,
-            format!(
-                "{name}: transport {:?} configured (active health probe not implemented)",
-                other.transport()
-            ),
-        ),
-    }
-}
-
-fn check_mcp_server_health(config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
-    let Some(config) = config else {
-        return DiagnosticCheck::new(
-            "MCP server health",
-            DiagnosticLevel::Warn,
-            "runtime config could not be loaded, so MCP servers were not inspected",
-        );
-    };
-    let servers = config.mcp().servers();
-    if servers.is_empty() {
-        return DiagnosticCheck::new(
-            "MCP server health",
-            DiagnosticLevel::Warn,
-            "no MCP servers are configured",
-        );
-    }
-    let results = servers
-        .iter()
-        .map(|(name, server)| check_one_mcp_server(name, server))
-        .collect::<Vec<_>>();
-    let level = if results
-        .iter()
-        .any(|(level, _)| *level == DiagnosticLevel::Fail)
-    {
-        DiagnosticLevel::Fail
-    } else if results
-        .iter()
-        .any(|(level, _)| *level == DiagnosticLevel::Warn)
-    {
-        DiagnosticLevel::Warn
-    } else {
-        DiagnosticLevel::Ok
-    };
-    DiagnosticCheck::new(
-        "MCP server health",
-        level,
-        format!("checked {} configured MCP server(s)", servers.len()),
-    )
-    .with_details(results.into_iter().map(|(_, detail)| detail).collect())
-}
-
-fn check_network_connectivity() -> DiagnosticCheck {
-    let address = match ("api.anthropic.com", 443).to_socket_addrs() {
-        Ok(mut addrs) => match addrs.next() {
-            Some(addr) => addr,
-            None => {
-                return DiagnosticCheck::new(
-                    "Network connectivity",
-                    DiagnosticLevel::Fail,
-                    "DNS resolution returned no addresses for api.anthropic.com",
-                );
-            }
-        },
-        Err(error) => {
-            return DiagnosticCheck::new(
-                "Network connectivity",
-                DiagnosticLevel::Fail,
-                format!("failed to resolve api.anthropic.com: {error}"),
-            );
-        }
-    };
-    match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
-        Ok(stream) => {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-            DiagnosticCheck::new(
-                "Network connectivity",
-                DiagnosticLevel::Ok,
-                format!("connected to {address}"),
-            )
-        }
-        Err(error) => DiagnosticCheck::new(
-            "Network connectivity",
-            DiagnosticLevel::Fail,
-            format!("failed to connect to {address}: {error}"),
-        ),
-    }
-}
-
-fn check_system_info(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
-    let mut details = vec![
-        format!("os={} arch={}", env::consts::OS, env::consts::ARCH),
-        format!("cwd={}", cwd.display()),
-        format!("cli_version={VERSION}"),
-        format!("build_target={}", BUILD_TARGET.unwrap_or("<unknown>")),
-        format!("git_sha={}", GIT_SHA.unwrap_or("<unknown>")),
-    ];
-    if let Some(config) = config {
-        details.push(format!(
-            "resolved_model={} loaded_config_files={}",
-            config.model().unwrap_or(DEFAULT_MODEL),
-            config.loaded_entries().len()
-        ));
-    }
-    DiagnosticCheck::new(
-        "System info",
-        DiagnosticLevel::Ok,
-        "captured local runtime and build metadata",
-    )
-    .with_details(details)
 }
 
 fn print_system_prompt(cwd: PathBuf, date: String) {
@@ -1668,9 +1043,7 @@ impl LiveCli {
             max_tokens: DEFAULT_MAX_TOKENS,
             messages: vec![InputMessage {
                 role: "user".to_string(),
-                content: vec![InputContentBlock::Text {
-                    text: input.to_string(),
-                }],
+                content: prompt_to_content_blocks(input, &env::current_dir()?)?,
             }],
             system: (!self.system_prompt.is_empty()).then(|| self.system_prompt.join("\n\n")),
             tools: None,
@@ -2647,7 +2020,7 @@ impl ApiClient for AnthropicRuntimeClient {
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: DEFAULT_MAX_TOKENS,
-            messages: convert_messages(&request.messages),
+            messages: convert_messages(&request.messages)?,
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self.enable_tools.then(|| {
                 filter_tool_specs(self.allowed_tools.as_ref())
@@ -2926,7 +2299,10 @@ fn tool_permission_specs() -> Vec<ToolSpec> {
     mvp_tool_specs()
 }
 
-fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
+fn convert_messages(messages: &[ConversationMessage]) -> Result<Vec<InputMessage>, RuntimeError> {
+    let cwd = env::current_dir().map_err(|error| {
+        RuntimeError::new(format!("failed to resolve current directory: {error}"))
+    })?;
     messages
         .iter()
         .filter_map(|message| {
@@ -2937,34 +2313,222 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
-            })
+                .try_fold(Vec::new(), |mut acc, block| {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            if message.role == MessageRole::User {
+                                acc.extend(
+                                    prompt_to_content_blocks(text, &cwd)
+                                        .map_err(RuntimeError::new)?,
+                                );
+                            } else {
+                                acc.push(InputContentBlock::Text { text: text.clone() });
+                            }
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            acc.push(InputContentBlock::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: serde_json::from_str(input)
+                                    .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                            });
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            output,
+                            is_error,
+                            ..
+                        } => acc.push(InputContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: vec![ToolResultContentBlock::Text {
+                                text: output.clone(),
+                            }],
+                            is_error: *is_error,
+                        }),
+                    }
+                    Ok::<_, RuntimeError>(acc)
+                });
+            match content {
+                Ok(content) if !content.is_empty() => Some(Ok(InputMessage {
+                    role: role.to_string(),
+                    content,
+                })),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
         })
         .collect()
+}
+
+fn prompt_to_content_blocks(input: &str, cwd: &Path) -> Result<Vec<InputContentBlock>, String> {
+    let mut blocks = Vec::new();
+    let mut text_buffer = String::new();
+    let mut chars = input.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        if ch == '!' && input[index..].starts_with("![") {
+            if let Some((alt_end, path_start, path_end)) = parse_markdown_image_ref(input, index) {
+                let _ = alt_end;
+                flush_text_block(&mut blocks, &mut text_buffer);
+                let path = &input[path_start..path_end];
+                blocks.push(load_image_block(path, cwd)?);
+                while let Some((next_index, _)) = chars.peek() {
+                    if *next_index < path_end + 1 {
+                        let _ = chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+
+        if ch == '@' && is_ref_boundary(input[..index].chars().next_back()) {
+            let path_end = find_path_end(input, index + 1);
+            if path_end > index + 1 {
+                let candidate = &input[index + 1..path_end];
+                if looks_like_image_ref(candidate, cwd) {
+                    flush_text_block(&mut blocks, &mut text_buffer);
+                    blocks.push(load_image_block(candidate, cwd)?);
+                    while let Some((next_index, _)) = chars.peek() {
+                        if *next_index < path_end {
+                            let _ = chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        text_buffer.push(ch);
+    }
+
+    flush_text_block(&mut blocks, &mut text_buffer);
+    if blocks.is_empty() {
+        blocks.push(InputContentBlock::Text {
+            text: input.to_string(),
+        });
+    }
+    Ok(blocks)
+}
+
+fn parse_markdown_image_ref(input: &str, start: usize) -> Option<(usize, usize, usize)> {
+    let after_bang = input.get(start + 2..)?;
+    let alt_end_offset = after_bang.find("](")?;
+    let path_start = start + 2 + alt_end_offset + 2;
+    let remainder = input.get(path_start..)?;
+    let path_end_offset = remainder.find(')')?;
+    let path_end = path_start + path_end_offset;
+    Some((start + 2 + alt_end_offset, path_start, path_end))
+}
+
+fn is_ref_boundary(ch: Option<char>) -> bool {
+    ch.is_none_or(char::is_whitespace)
+}
+
+fn find_path_end(input: &str, start: usize) -> usize {
+    input[start..]
+        .char_indices()
+        .find_map(|(offset, ch)| (ch.is_whitespace()).then_some(start + offset))
+        .unwrap_or(input.len())
+}
+
+fn looks_like_image_ref(candidate: &str, cwd: &Path) -> bool {
+    let resolved = resolve_prompt_path(candidate, cwd);
+    media_type_for_path(Path::new(candidate)).is_some()
+        || resolved.is_file()
+        || candidate.contains(std::path::MAIN_SEPARATOR)
+        || candidate.starts_with("./")
+        || candidate.starts_with("../")
+}
+
+fn flush_text_block(blocks: &mut Vec<InputContentBlock>, text_buffer: &mut String) {
+    if text_buffer.is_empty() {
+        return;
+    }
+    blocks.push(InputContentBlock::Text {
+        text: std::mem::take(text_buffer),
+    });
+}
+
+fn load_image_block(path_ref: &str, cwd: &Path) -> Result<InputContentBlock, String> {
+    let resolved = resolve_prompt_path(path_ref, cwd);
+    let media_type = media_type_for_path(&resolved).ok_or_else(|| {
+        format!(
+            "unsupported image format for reference {IMAGE_REF_PREFIX}{path_ref}; supported: png, jpg, jpeg, gif, webp"
+        )
+    })?;
+    let bytes = fs::read(&resolved).map_err(|error| {
+        format!(
+            "failed to read image reference {}: {error}",
+            resolved.display()
+        )
+    })?;
+    Ok(InputContentBlock::Image {
+        source: ImageSource {
+            kind: "base64".to_string(),
+            media_type: media_type.to_string(),
+            data: encode_base64(&bytes),
+        },
+    })
+}
+
+fn resolve_prompt_path(path_ref: &str, cwd: &Path) -> PathBuf {
+    let path = Path::new(path_ref);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn media_type_for_path(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::new();
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        let block = (u32::from(bytes[index]) << 16)
+            | (u32::from(bytes[index + 1]) << 8)
+            | u32::from(bytes[index + 2]);
+        output.push(TABLE[((block >> 18) & 0x3F) as usize] as char);
+        output.push(TABLE[((block >> 12) & 0x3F) as usize] as char);
+        output.push(TABLE[((block >> 6) & 0x3F) as usize] as char);
+        output.push(TABLE[(block & 0x3F) as usize] as char);
+        index += 3;
+    }
+
+    match bytes.len().saturating_sub(index) {
+        1 => {
+            let block = u32::from(bytes[index]) << 16;
+            output.push(TABLE[((block >> 18) & 0x3F) as usize] as char);
+            output.push(TABLE[((block >> 12) & 0x3F) as usize] as char);
+            output.push('=');
+            output.push('=');
+        }
+        2 => {
+            let block = (u32::from(bytes[index]) << 16) | (u32::from(bytes[index + 1]) << 8);
+            output.push(TABLE[((block >> 18) & 0x3F) as usize] as char);
+            output.push(TABLE[((block >> 12) & 0x3F) as usize] as char);
+            output.push(TABLE[((block >> 6) & 0x3F) as usize] as char);
+            output.push('=');
+        }
+        _ => {}
+    }
+
+    output
 }
 
 fn print_help() {
@@ -2984,7 +2548,6 @@ fn print_help() {
     println!("  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
     println!("  rusty-claude-cli login");
     println!("  rusty-claude-cli logout");
-    println!("  rusty-claude-cli doctor");
     println!();
     println!("Flags:");
     println!("  --model MODEL              Override the active model");
@@ -3011,7 +2574,6 @@ fn print_help() {
     println!("  rusty-claude-cli --allowedTools read,glob \"summarize Cargo.toml\"");
     println!("  rusty-claude-cli --resume session.json /status /diff /export notes.txt");
     println!("  rusty-claude-cli login");
-    println!("  rusty-claude-cli doctor");
 }
 
 #[cfg(test)]
@@ -3025,8 +2587,10 @@ mod tests {
         render_memory_report, render_repl_help, resume_supported_slash_commands, status_context,
         CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
+    use api::InputContentBlock;
     use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn defaults_to_repl_when_no_args() {
@@ -3153,7 +2717,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_login_logout_and_doctor_subcommands() {
+    fn parses_login_and_logout_subcommands() {
         assert_eq!(
             parse_args(&["login".to_string()]).expect("login should parse"),
             CliAction::Login
@@ -3161,10 +2725,6 @@ mod tests {
         assert_eq!(
             parse_args(&["logout".to_string()]).expect("logout should parse"),
             CliAction::Logout
-        );
-        assert_eq!(
-            parse_args(&["doctor".to_string()]).expect("doctor should parse"),
-            CliAction::Doctor
         );
     }
 
@@ -3429,7 +2989,7 @@ mod tests {
     fn status_context_reads_real_workspace_metadata() {
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
-        assert_eq!(context.discovered_config_files, 5);
+        assert!(context.discovered_config_files >= 3);
         assert!(context.loaded_config_files <= context.discovered_config_files);
     }
 
@@ -3513,10 +3073,109 @@ mod tests {
             },
         ];
 
-        let converted = super::convert_messages(&messages);
+        let converted = super::convert_messages(&messages).expect("messages should convert");
         assert_eq!(converted.len(), 3);
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
+    }
+
+    #[test]
+    fn prompt_to_content_blocks_keeps_text_only_prompt() {
+        let blocks = super::prompt_to_content_blocks("hello world", Path::new("."))
+            .expect("text prompt should parse");
+        assert_eq!(
+            blocks,
+            vec![InputContentBlock::Text {
+                text: "hello world".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn prompt_to_content_blocks_embeds_at_image_refs() {
+        let temp = temp_fixture_dir("at-image-ref");
+        let image_path = temp.join("sample.png");
+        std::fs::write(&image_path, [1_u8, 2, 3]).expect("fixture write");
+        let prompt = format!("describe @{} please", image_path.display());
+
+        let blocks = super::prompt_to_content_blocks(&prompt, Path::new("."))
+            .expect("image ref should parse");
+
+        assert!(matches!(
+            &blocks[0],
+            InputContentBlock::Text { text } if text == "describe "
+        ));
+        assert!(matches!(
+            &blocks[1],
+            InputContentBlock::Image { source }
+                if source.kind == "base64"
+                    && source.media_type == "image/png"
+                    && source.data == "AQID"
+        ));
+        assert!(matches!(
+            &blocks[2],
+            InputContentBlock::Text { text } if text == " please"
+        ));
+    }
+
+    #[test]
+    fn prompt_to_content_blocks_embeds_markdown_image_refs() {
+        let temp = temp_fixture_dir("markdown-image-ref");
+        let image_path = temp.join("sample.webp");
+        std::fs::write(&image_path, [255_u8]).expect("fixture write");
+        let prompt = format!("see ![asset]({}) now", image_path.display());
+
+        let blocks = super::prompt_to_content_blocks(&prompt, Path::new("."))
+            .expect("markdown image ref should parse");
+
+        assert!(matches!(
+            &blocks[1],
+            InputContentBlock::Image { source }
+                if source.media_type == "image/webp" && source.data == "/w=="
+        ));
+    }
+
+    #[test]
+    fn prompt_to_content_blocks_rejects_unsupported_formats() {
+        let temp = temp_fixture_dir("unsupported-image-ref");
+        let image_path = temp.join("sample.bmp");
+        std::fs::write(&image_path, [1_u8]).expect("fixture write");
+        let prompt = format!("describe @{}", image_path.display());
+
+        let error = super::prompt_to_content_blocks(&prompt, Path::new("."))
+            .expect_err("unsupported image ref should fail");
+
+        assert!(error.contains("unsupported image format"));
+    }
+
+    #[test]
+    fn convert_messages_expands_user_text_image_refs() {
+        let temp = temp_fixture_dir("convert-message-image-ref");
+        let image_path = temp.join("sample.gif");
+        std::fs::write(&image_path, [71_u8, 73, 70]).expect("fixture write");
+        let messages = vec![ConversationMessage::user_text(format!(
+            "inspect @{}",
+            image_path.display()
+        ))];
+
+        let converted = super::convert_messages(&messages).expect("messages should convert");
+
+        assert_eq!(converted.len(), 1);
+        assert!(matches!(
+            &converted[0].content[1],
+            InputContentBlock::Image { source }
+                if source.media_type == "image/gif" && source.data == "R0lG"
+        ));
+    }
+
+    fn temp_fixture_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should advance")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rusty-claude-cli-{label}-{unique}"));
+        std::fs::create_dir_all(&path).expect("temp dir should exist");
+        path
     }
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
@@ -3524,87 +3183,6 @@ mod tests {
         assert!(help.contains("Up/Down"));
         assert!(help.contains("Tab"));
         assert!(help.contains("Shift+Enter/Ctrl+J"));
-    }
-
-    #[test]
-    fn oauth_status_classifies_missing_and_expired_tokens() {
-        let root = std::env::temp_dir().join(format!(
-            "doctor-oauth-status-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("temp dir");
-        std::env::set_var("CLAUDE_CONFIG_HOME", &root);
-
-        assert_eq!(
-            super::classify_oauth_status()
-                .expect("missing should classify")
-                .0,
-            super::OAuthDiagnosticStatus::Missing
-        );
-
-        runtime::save_oauth_credentials(&runtime::OAuthTokenSet {
-            access_token: "token".to_string(),
-            refresh_token: Some("refresh".to_string()),
-            expires_at: Some(1),
-            scopes: vec!["scope:a".to_string()],
-        })
-        .expect("save oauth");
-        assert_eq!(
-            super::classify_oauth_status()
-                .expect("expired should classify")
-                .0,
-            super::OAuthDiagnosticStatus::ExpiredRefreshable
-        );
-
-        runtime::clear_oauth_credentials().expect("clear oauth");
-        std::fs::remove_dir_all(&root).expect("cleanup");
-        std::env::remove_var("CLAUDE_CONFIG_HOME");
-    }
-
-    #[test]
-    fn config_validation_flags_invalid_json() {
-        let root = std::env::temp_dir().join(format!(
-            "doctor-config-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("temp dir");
-        let path = root.join("settings.json");
-        std::fs::write(&path, "[]").expect("write invalid top-level");
-        let check = super::validate_config_file(&path);
-        assert!(check.exists);
-        assert!(!check.valid);
-        assert!(check.note.contains("not an object"));
-        std::fs::remove_dir_all(&root).expect("cleanup");
-    }
-
-    #[test]
-    fn doctor_report_renders_requested_sections() {
-        let report = super::DoctorReport {
-            checks: vec![
-                super::DiagnosticCheck::new(
-                    "API key validity",
-                    super::DiagnosticLevel::Ok,
-                    "accepted",
-                ),
-                super::DiagnosticCheck::new(
-                    "System info",
-                    super::DiagnosticLevel::Warn,
-                    "captured",
-                )
-                .with_details(vec!["os=linux".to_string()]),
-            ],
-        };
-        let rendered = report.render();
-        assert!(rendered.contains("Doctor diagnostics"));
-        assert!(rendered.contains("API key validity"));
-        assert!(rendered.contains("System info"));
-        assert!(rendered.contains("Warnings         1"));
     }
 
     #[test]
